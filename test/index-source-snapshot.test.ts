@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import {
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeEach, it, vi } from 'vitest';
 import { ContentFilterError, type ContentFilter } from '../src/indexing/content-filter.js';
-
-vi.mock('node:fs/promises', async (importOriginal) => {
-  const original = await importOriginal<typeof import('node:fs/promises')>();
-  return { ...original, readFile: vi.fn(original.readFile) };
-});
 
 const vault = mkdtempSync(path.join(tmpdir(), 'ohs-source-snapshot-'));
 vi.stubEnv('OBSIDIAN_VAULT_PATH', vault);
@@ -28,12 +31,21 @@ vi.spyOn(embedder, 'embedDetailed').mockImplementation((texts) =>
     texts.map(() => ({ ok: true as const, embedding: new Float32Array([1, 0, 0, 0]) })),
   ),
 );
+const sourceReaders = await import('../src/vault/note-source.js');
+const createSourceReader = sourceReaders.createNoteSourceReader;
+const readSource = vi.fn((reader: ReturnType<typeof createSourceReader>, notePath: string) =>
+  reader.readWithStat(notePath),
+);
+vi.spyOn(sourceReaders, 'createNoteSourceReader').mockImplementation((root) => {
+  const reader = createSourceReader(root);
+  return { ...reader, readWithStat: (notePath) => readSource(reader, notePath) };
+});
 const storage = await import('./helpers/owned-storage.js');
 const writes = await import('../src/storage/db.js');
 const { indexFile, resetIndexingState, startBackgroundIndexing } =
   await import('../src/indexing/indexer.js');
 const { createIndexService } = await import('../src/indexing/index-service.js');
-const originalRead = vi.mocked(readFile).getMockImplementation()!;
+const originalRead = readSource.getMockImplementation()!;
 const file = path.join(vault, 'a.md');
 const toxic = 'Source that fails content filtering.';
 const timeout = () => new ContentFilterError(new Error('Fixture source timeout'), 'job');
@@ -51,7 +63,7 @@ beforeEach(() => {
   storage.openDb();
   storage.initVecTable(4);
   resetIndexingState();
-  vi.mocked(readFile).mockReset().mockImplementation(originalRead);
+  readSource.mockReset().mockImplementation(originalRead);
   writeFileSync(file, 'Original safe snapshot.');
   utimesSync(file, 1, 1);
 });
@@ -70,7 +82,7 @@ it.each(['before', 'after'] as const)(
       assert.equal(await indexFile(run, file, 512), 'indexed');
       // The unchanged hash must only be trusted after the read is validated.
       utimesSync(file, 2, 2);
-      vi.mocked(readFile).mockImplementationOnce(async (...args) => {
+      readSource.mockImplementationOnce(async (...args) => {
         if (when === 'before') writeFileSync(file, toxic);
         const raw = await originalRead(...args);
         if (when === 'after') writeFileSync(file, toxic);
@@ -95,6 +107,65 @@ it.each(['before', 'after'] as const)(
     });
   },
 );
+
+it('rereads a replaced descriptor snapshot before trusting an unchanged hash', async () => {
+  await storage.withTestIndexRun(async (run) => {
+    assert.equal(await indexFile(run, file, 512), 'indexed');
+    utimesSync(file, 2, 2);
+    readSource.mockClear();
+    let replacementContent = '';
+    readSource.mockImplementationOnce(async (...args) => {
+      const source = await originalRead(...args);
+      assert.ok(source);
+      replacementContent = 'X'.repeat(source.raw.length);
+      const replacement = path.join(vault, 'replacement.tmp');
+      writeFileSync(replacement, replacementContent);
+      utimesSync(replacement, source.stat.atime, source.stat.mtime);
+      renameSync(replacement, file);
+      return source;
+    });
+
+    assert.equal(await indexFile(run, file, 512), 'indexed');
+    assert.equal(readSource.mock.calls.length, 2);
+    assert.equal(storage.getNoteByPath('a.md')?.content, replacementContent);
+  });
+});
+
+it('preserves the index when a pinned source is replaced by an external symlink', async (context) => {
+  await storage.withTestIndexRun(async (run) => {
+    assert.equal(await indexFile(run, file, 512), 'indexed');
+    writeFileSync(file, 'Safe edited source.');
+    const external = `${vault}-private.md`;
+    writeFileSync(external, 'Private external source.');
+    vi.mocked(embedder.embedDetailed).mockClear();
+    let symlinkUnavailable = false;
+    readSource.mockImplementationOnce(async (...args) => {
+      const source = await originalRead(...args);
+      unlinkSync(file);
+      try {
+        symlinkSync(external, file, 'file');
+      } catch (error) {
+        symlinkUnavailable =
+          process.platform === 'win32' &&
+          error instanceof Error &&
+          'code' in error &&
+          ['EPERM', 'EACCES'].includes(String(error.code));
+        throw error;
+      }
+      return source;
+    });
+    try {
+      const result = await indexFile(run, file, 512);
+      if (symlinkUnavailable) context.skip('File symlink creation requires Windows privileges.');
+      assert.equal(typeof result, 'object');
+      if (typeof result === 'object') assert.match(result.error, /symbolic links/);
+      assert.equal(storage.getNoteByPath('a.md')?.content, 'Original safe snapshot.');
+      assert.equal(vi.mocked(embedder.embedDetailed).mock.calls.length, 0);
+    } finally {
+      rmSync(external, { force: true });
+    }
+  });
+});
 
 it('does not attach an old filtering failure to an edit made during filtering', async () => {
   await storage.withTestIndexRun(async (owner) => {
@@ -141,15 +212,18 @@ it('records publication failures against the snapshot obtained by rereading a ch
   await storage.withTestIndexRun(async (run) => {
     assert.equal(await indexFile(run, file, 512), 'indexed');
     utimesSync(file, 2, 2);
-    vi.mocked(readFile).mockImplementationOnce((...args) => {
+    readSource.mockClear();
+    readSource.mockImplementationOnce(async (...args) => {
+      const source = await originalRead(...args);
       writeFileSync(file, 'Edited source consumed after the read race.');
-      return originalRead(...args);
+      return source;
     });
     const commit = vi.spyOn(writes, 'commitIndexedNote').mockImplementation(() => {
       throw new Error('Fixture publication unavailable');
     });
     try {
       assert.equal(typeof (await indexFile(run, file, 512)), 'object');
+      assert.equal(readSource.mock.calls.length, 2);
       const failed = storage.getIndexFailures();
       assert.equal(failed[0]?.attempts, 1);
       await startBackgroundIndexing(run, 512);
@@ -174,7 +248,7 @@ it('bounds changing reads, preserves the indexed snapshot and recovers once edit
     assert.equal(await indexFile(run, file, 512), 'indexed');
     writeFileSync(file, 'Unstable edited source.');
     let reads = 0;
-    vi.mocked(readFile).mockImplementation(async (...args) => {
+    readSource.mockImplementation(async (...args) => {
       const raw = await originalRead(...args);
       writeFileSync(file, `Unstable edited source. ${'x'.repeat(++reads)}`);
       return raw;
@@ -185,7 +259,7 @@ it('bounds changing reads, preserves the indexed snapshot and recovers once edit
     assert.ok(reads > 0 && reads <= 2, `Read ${reads} changing snapshots`);
     assert.equal(storage.getNoteByPath('a.md')?.content, 'Original safe snapshot.');
     assert.equal(storage.getIndexFailures()[0]?.attempts, 1);
-    vi.mocked(readFile).mockImplementation(originalRead);
+    readSource.mockImplementation(originalRead);
     writeFileSync(file, 'Settled source.');
     await startBackgroundIndexing(run, 512);
     assert.equal(storage.getNoteByPath('a.md')?.content, 'Settled source.');
